@@ -1,9 +1,6 @@
 {
-"name": "horestore-bot",
-"version": "1.0.0",
-"private": true,
-"dependencies": {
-"@supabase/supabase-js": "^2.49.1",
-"tweetnacl": "^1.0.3"
-}
+  "dependencies": {
+    "@supabase/supabase-js": "^2.0.0",
+    "tweetnacl": "^1.0.3"
+  }
 }
