@@ -1,14 +1,9 @@
 {
-  "name": "horestore-bot",
-  "version": "1.0.0",
-  "private": true,
-  "main": "api/interactions.js",
-  "scripts": {
-    "start": "node api/interactions.js"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.49.1",
-    "discord-interactions": "^4.1.0",
-    "discord.js": "^14.18.0"
-  }
+"name": "horestore-bot",
+"version": "1.0.0",
+"private": true,
+"dependencies": {
+"@supabase/supabase-js": "^2.49.1",
+"tweetnacl": "^1.0.3"
+}
 }
