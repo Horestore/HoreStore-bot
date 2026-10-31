@@ -1,429 +1,545 @@
 const crypto = require("crypto");
 const { createClient } = require("@supabase/supabase-js");
-const nacl = require("tweetnacl");
 
 const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID || "";
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
-// URL QRIS setelah deploy.
-// Contoh: https://horestore-bot.vercel.app/qris.png.jpg
-const QRIS_URL = process.env.QRIS_URL || "";
+const QRIS_URL =
+  process.env.QRIS_URL ||
+  "https://horestorebot.vercel.app/qris.png.jpg";
 
-if (!DISCORD_PUBLIC_KEY) throw new Error("DISCORD_PUBLIC_KEY belum diisi");
-if (!DISCORD_TOKEN) throw new Error("DISCORD_TOKEN belum diisi");
-if (!SUPABASE_URL) throw new Error("SUPABASE_URL belum diisi");
-if (!SUPABASE_SERVICE_KEY) throw new Error("SUPABASE_SERVICE_KEY belum diisi");
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_KEY
+);
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+// Discord membutuhkan raw body untuk signature verification
+module.exports.config = {
+  api: {
+    bodyParser: false,
+  },
+};
 
-// =====================================================
-// HELPER
-// =====================================================
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
 
-function rupiah(n) {
-return "Rp" + Number(n || 0).toLocaleString("id-ID");
+    req.on("data", (chunk) => {
+      chunks.push(chunk);
+    });
+
+    req.on("end", () => {
+      resolve(Buffer.concat(chunks));
+    });
+
+    req.on("error", reject);
+  });
 }
 
-function getUserId(interaction) {
-return interaction.member?.user?.id || interaction.user?.id;
+function verifyDiscordSignature(rawBody, signature, timestamp) {
+  if (!signature || !timestamp || !DISCORD_PUBLIC_KEY) {
+    return false;
+  }
+
+  try {
+    const publicKeyDer = Buffer.concat([
+      Buffer.from(
+        "302a300506032b6570032100",
+        "hex"
+      ),
+      Buffer.from(DISCORD_PUBLIC_KEY, "hex"),
+    ]);
+
+    const publicKey = crypto.createPublicKey({
+      key: publicKeyDer,
+      format: "der",
+      type: "spki",
+    });
+
+    return crypto.verify(
+      null,
+      Buffer.concat([
+        Buffer.from(timestamp),
+        rawBody,
+      ]),
+      publicKey,
+      Buffer.from(signature, "hex")
+    );
+  } catch (error) {
+    console.error(
+      "Signature verification error:",
+      error
+    );
+
+    return false;
+  }
 }
 
-function isAdmin(interaction) {
-if (!interaction.member) return false;
-
-// Administrator permission
-const permissions = BigInt(interaction.member.permissions || "0");
-
-if ((permissions & 8n) === 8n) return true;
-
-if (!ADMIN_ROLE_ID) return false;
-
-return interaction.member.roles?.includes(ADMIN_ROLE_ID);
+function rupiah(number) {
+  return (
+    "Rp" +
+    Number(number || 0).toLocaleString("id-ID")
+  );
 }
 
-// =====================================================
-// HITUNG HARGA
-//
-// 1.000 Robux = Rp158.000
-// Sisa = Rp160 / Robux
-// =====================================================
+function isAdministrator(interaction) {
+  const permissions = BigInt(
+    interaction.member?.permissions || "0"
+  );
 
+  return (permissions & 8n) === 8n;
+}
+
+// Harga:
+// Setiap 1.000 Robux = Rp158.000
+// Sisanya = Rp160 per Robux
 function calculatePrice(robux) {
-const thousands = Math.floor(robux / 1000);
-const remainder = robux % 1000;
+  const thousands = Math.floor(robux / 1000);
+  const remainder = robux % 1000;
 
-return thousands * 158000 + remainder * 160;
+  return (
+    thousands * 158000 +
+    remainder * 160
+  );
 }
 
-// =====================================================
-// DISCORD API
-// =====================================================
+async function discordFetch(endpoint) {
+  const response = await fetch(
+    `https://discord.com/api/v10${endpoint}`,
+    {
+      headers: {
+        Authorization: `Bot ${DISCORD_TOKEN}`,
+      },
+    }
+  );
 
-async function discordFetch(endpoint, options = {}) {
-const response = await fetch(
-"https://discord.com/api/v10${endpoint}",
-{
-...options,
-headers: {
-Authorization: "Bot ${DISCORD_TOKEN}",
-"Content-Type": "application/json",
-...(options.headers || {}),
-},
-}
-);
+  if (!response.ok) {
+    const errorText = await response.text();
 
-if (!response.ok) {
-const text = await response.text();
-throw new Error("Discord API error: ${response.status} ${text}");
-}
+    throw new Error(
+      `Discord API Error: ${response.status} ${errorText}`
+    );
+  }
 
-return response.json();
+  return response.json();
 }
 
-// =====================================================
-// AMBIL DATA TICKET KING
-// =====================================================
+// Membaca pesan terbaru dari Ticket King
+// dan mencari field "berapa robux?"
+async function readTicketOrder(channelId) {
+  const messages = await discordFetch(
+    `/channels/${channelId}/messages?limit=100`
+  );
 
-async function readTicketKingOrder(channelId) {
-// Ambil 50 pesan terbaru dalam ticket
-const messages = await discordFetch(
-"/channels/${channelId}/messages?limit=50"
-);
+  for (const message of messages) {
+    for (const embed of message.embeds || []) {
+      let robux = null;
+      let username = null;
 
-// Cari pesan terbaru yang memiliki embed
-for (const message of messages) {
-if (!message.embeds || !message.embeds.length) continue;
+      for (const field of embed.fields || []) {
+        const fieldName = String(
+          field.name || ""
+        )
+          .toLowerCase()
+          .trim();
 
-for (const embed of message.embeds) {
-  if (!embed.fields || !embed.fields.length) continue;
+        const fieldValue = String(
+          field.value || ""
+        ).trim();
 
-  let robux = null;
-  let robloxUsername = null;
+        if (
+          fieldName.includes("berapa robux")
+        ) {
+          const digits = fieldValue.replace(
+            /[^\d]/g,
+            ""
+          );
 
-  for (const field of embed.fields) {
-    const fieldName = String(field.name || "")
-      .toLowerCase()
-      .trim();
+          if (digits) {
+            robux = Number(digits);
+          }
+        }
 
-    const fieldValue = String(field.value || "").trim();
+        if (
+          fieldName === "username" ||
+          fieldName.includes("roblox username") ||
+          fieldName.includes("username roblox")
+        ) {
+          username = fieldValue;
+        }
+      }
 
-    // Cari field "berapa robux?"
-    if (
-      fieldName.includes("berapa robux") ||
-      fieldName.includes("robux")
-    ) {
-      // Ambil angka dari isi field.
-      // Contoh: "200" → 200
-      const match = fieldValue.replace(/\./g, "").match(/\d+/);
-
-      if (match) {
-        robux = Number(match[0]);
+      if (robux && robux > 0) {
+        return {
+          robux,
+          username,
+          messageId: message.id,
+        };
       }
     }
+  }
 
-    // Cari username Roblox
-    if (
-      fieldName === "username" ||
-      fieldName.includes("roblox username")
-    ) {
-      robloxUsername = fieldValue;
+  return null;
+}
+
+async function generateUniqueCode() {
+  for (let i = 0; i < 100; i++) {
+    const uniqueCode = crypto.randomInt(
+      11,
+      100
+    );
+
+    const { data, error } = await supabase
+      .from("orders")
+      .select("id")
+      .eq("unique_code", uniqueCode)
+      .eq("status", "PENDING")
+      .limit(1);
+
+    if (error) {
+      throw error;
+    }
+
+    if (!data || data.length === 0) {
+      return uniqueCode;
     }
   }
 
-  // Kalau jumlah Robux ditemukan, gunakan order ini
-  if (robux && robux > 0) {
-    return {
-      robux,
-      robloxUsername,
-      messageId: message.id,
-    };
-  }
+  throw new Error(
+    "Kode unik sedang penuh. Coba lagi."
+  );
 }
 
+function createOrderCode() {
+  const time = Date.now()
+    .toString()
+    .slice(-8);
+
+  const random = crypto.randomInt(
+    100,
+    1000
+  );
+
+  return `HOR-${time}-${random}`;
 }
 
-return null;
+function responseMessage(
+  content,
+  ephemeral = false
+) {
+  return {
+    type: 4,
+    data: {
+      content,
+      flags: ephemeral ? 64 : 0,
+    },
+  };
 }
-
-// =====================================================
-// KODE UNIK
-// =====================================================
-
-async function generateUniqueCode() {
-for (let i = 0; i < 200; i++) {
-const code = crypto.randomInt(11, 100);
-
-const { data, error } = await supabase
-  .from("orders")
-  .select("id")
-  .eq("unique_code", code)
-  .eq("status", "PENDING")
-  .limit(1);
-
-if (error) throw error;
-
-if (!data || data.length === 0) {
-  return code;
-}
-
-}
-
-throw new Error("Kode unik sedang penuh. Coba lagi.");
-}
-
-function makeOrderCode() {
-return (
-"HOR-" +
-Date.now().toString().slice(-7) +
-"-" +
-crypto.randomInt(100, 999)
-);
-}
-
-// =====================================================
-// VERIFIKASI REQUEST DISCORD
-// =====================================================
-
-function verifyDiscordRequest(req) {
-const signature = req.headers["x-signature-ed25519"];
-const timestamp = req.headers["x-signature-timestamp"];
-
-if (!signature || !timestamp) return false;
-
-const rawBody =
-typeof req.body === "string"
-? req.body
-: JSON.stringify(req.body);
-
-return nacl.sign.detached.verify(
-Buffer.from(timestamp + rawBody),
-Buffer.from(signature, "hex"),
-Buffer.from(DISCORD_PUBLIC_KEY, "hex")
-);
-}
-
-// =====================================================
-// RESPONSE HELPER
-// =====================================================
-
-function responseMessage(content, ephemeral = false) {
-return {
-type: 4,
-data: {
-content,
-flags: ephemeral ? 64 : 0,
-},
-};
-}
-
-// =====================================================
-// /PAY
-// =====================================================
 
 async function handlePay(interaction) {
-if (!isAdmin(interaction)) {
-return responseMessage(
-"❌ Command "/pay" hanya bisa digunakan admin.",
-true
-);
-}
-
-const channelId = interaction.channel_id;
-
-// Cari data dari Ticket King
-const ticketData = await readTicketKingOrder(channelId);
-
-if (!ticketData) {
-return responseMessage(
-"❌ Data order Ticket King tidak ditemukan.\nPastikan form order sudah dikirim terlebih dahulu.",
-true
-);
-}
-
-const robux = ticketData.robux;
-
-// Pastikan kelipatan 100
-if (robux % 100 !== 0) {
-return responseMessage(
-"❌ Jumlah yang terbaca (${robux} Robux) bukan kelipatan 100.",
-true
-);
-}
-
-const basePrice = calculatePrice(robux);
-const uniqueCode = await generateUniqueCode();
-const totalPrice = basePrice + uniqueCode;
-
-const orderCode = makeOrderCode();
-
-// Cari buyer dari owner ticket.
-// Sementara menggunakan user yang menjalankan /pay jika
-// owner ticket belum bisa dideteksi dari Ticket King.
-const discordId = getUserId(interaction);
-
-// Simpan order
-const { error } = await supabase
-.from("orders")
-.insert({
-order_code: orderCode,
-discord_id: discordId,
-discord_username:
-interaction.member?.user?.username || "Unknown",
-roblox_username: ticketData.robloxUsername,
-robux,
-base_price: basePrice,
-unique_code: uniqueCode,
-total_price: totalPrice,
-status: "PENDING",
-channel_id: channelId,
-});
-
-if (error) {
-throw error;
-}
-
-const qrisImageUrl = QRIS_URL;
-
-return {
-type: 4,
-data: {
-embeds: [
-{
-title: "💳 PEMBAYARAN HORE STORE",
-description:
-"🧾 **Order:** \"${orderCode}`\n\n"+"🎮 Username: `${ticketData.robloxUsername || "-"}`\n"+"🪙 Robux: ${robux.toLocaleString("id-ID")}\n\n"+"💰 Harga: ${rupiah(basePrice)}\n"+"🔢 Kode Unik: ${uniqueCode}\n\n"+"💳 TOTAL BAYAR: ${rupiah(totalPrice)}\n\n"+"⚠️ Bayar TEPAT sesuai nominal yang tertera.\n"+"📱 Scan QRIS di bawah.", image: qrisImageUrl ? { url: qrisImageUrl } : undefined, footer: { text: "HORE STORE • Menunggu Pembayaran", }, }, ], components: [ { type: 1, components: [ { type: 2, style: 3, label: "💳 Saya Sudah Bayar", custom_id: "paid_${orderCode}", }, { type: 2, style: 4, label: "❌ Batalkan", custom_id: "cancel_${orderCode}`,
-},
-],
-},
-],
-},
-};
-}
-
-// =====================================================
-// TOMBOL SUDAH BAYAR
-// =====================================================
-
-async function handlePaid(interaction, orderCode) {
-const { data: order } = await supabase
-.from("orders")
-.select("*")
-.eq("order_code", orderCode)
-.single();
-
-if (!order) {
-return responseMessage("❌ Order tidak ditemukan.", true);
-}
-
-return responseMessage(
-"⏳ **Pembayaran sedang menunggu pengecekan admin.**\n\n" +
-"🧾 Order: \"${order.order_code}`\n"+"💳 Total: ${rupiah(order.total_price)}`,
-true
-);
-}
-
-// =====================================================
-// BATALKAN ORDER
-// =====================================================
-
-async function handleCancel(interaction, orderCode) {
-const { error } = await supabase
-.from("orders")
-.update({ status: "CANCELLED" })
-.eq("order_code", orderCode)
-.eq("status", "PENDING");
-
-if (error) throw error;
-
-return responseMessage(
-"❌ Order \"${orderCode}` berhasil dibatalkan.`,
-true
-);
-}
-
-// =====================================================
-// VERCEL HANDLER
-// =====================================================
-
-module.exports = async (req, res) => {
-try {
-if (req.method !== "POST") {
-return res.status(405).json({
-error: "Method Not Allowed",
-});
-}
-
-if (!verifyDiscordRequest(req)) {
-  return res.status(401).json({
-    error: "Invalid request signature",
-  });
-}
-
-const interaction =
-  typeof req.body === "string"
-    ? JSON.parse(req.body)
-    : req.body;
-
-// Discord PING
-if (interaction.type === 1) {
-  return res.status(200).json({
-    type: 1,
-  });
-}
-
-let response;
-
-// BUTTON
-if (interaction.type === 3) {
-  const customId = interaction.data.custom_id;
-
-  if (customId.startsWith("paid_")) {
-    response = await handlePaid(
-      interaction,
-      customId.replace("paid_", "")
-    );
-  } else if (customId.startsWith("cancel_")) {
-    response = await handleCancel(
-      interaction,
-      customId.replace("cancel_", "")
-    );
-  } else {
-    response = responseMessage("❌ Tombol tidak dikenal.", true);
-  }
-
-  return res.status(200).json(response);
-}
-
-// SLASH COMMAND
-if (interaction.type === 2) {
-  const command = interaction.data.name;
-
-  if (command === "pay") {
-    response = await handlePay(interaction);
-  } else {
-    response = responseMessage(
-      "❌ Command belum tersedia.",
+  if (!isAdministrator(interaction)) {
+    return responseMessage(
+      "❌ Command `/pay` hanya bisa digunakan oleh Administrator.",
       true
     );
   }
 
-  return res.status(200).json(response);
+  if (!DISCORD_TOKEN) {
+    throw new Error(
+      "DISCORD_TOKEN belum diisi di Vercel."
+    );
+  }
+
+  const ticket = await readTicketOrder(
+    interaction.channel_id
+  );
+
+  if (!ticket) {
+    return responseMessage(
+      "❌ Tidak menemukan jumlah Robux dari form Ticket King di channel ini.",
+      true
+    );
+  }
+
+  const robux = ticket.robux;
+
+  if (robux % 100 !== 0) {
+    return responseMessage(
+      `❌ Jumlah ${robux} Robux harus kelipatan 100.`,
+      true
+    );
+  }
+
+  const basePrice = calculatePrice(robux);
+
+  const uniqueCode =
+    await generateUniqueCode();
+
+  const totalPrice =
+    basePrice + uniqueCode;
+
+  const orderCode =
+    createOrderCode();
+
+  const { error } = await supabase
+    .from("orders")
+    .insert({
+      order_code: orderCode,
+      discord_id: "TICKET_BUYER",
+      discord_username: "Ticket King Buyer",
+      roblox_username:
+        ticket.username || null,
+      robux: robux,
+      base_price: basePrice,
+      unique_code: uniqueCode,
+      total_price: totalPrice,
+      status: "PENDING",
+      channel_id: interaction.channel_id,
+    });
+
+  if (error) {
+    throw error;
+  }
+
+  return {
+    type: 4,
+
+    data: {
+      embeds: [
+        {
+          title:
+            "💳 PEMBAYARAN HORE STORE",
+
+          description:
+            `🧾 **Order:** \`${orderCode}\`\n\n` +
+            `🎮 **Username:** \`${ticket.username || "-"}\`\n` +
+            `🪙 **Robux:** **${robux.toLocaleString("id-ID")}**\n\n` +
+            `💰 **Harga:** ${rupiah(basePrice)}\n` +
+            `🔢 **Kode Unik:** ${uniqueCode}\n\n` +
+            `💳 **TOTAL BAYAR: ${rupiah(totalPrice)}**\n\n` +
+            `⚠️ Bayar tepat sesuai nominal.\n` +
+            `📱 Scan QRIS di bawah.`,
+
+          image: {
+            url: QRIS_URL,
+          },
+
+          footer: {
+            text:
+              "HORE STORE • Menunggu Pembayaran",
+          },
+        },
+      ],
+
+      components: [
+        {
+          type: 1,
+
+          components: [
+            {
+              type: 2,
+              style: 3,
+              label:
+                "💳 Saya Sudah Bayar",
+
+              custom_id:
+                `paid_${orderCode}`,
+            },
+
+            {
+              type: 2,
+              style: 4,
+              label:
+                "❌ Batalkan",
+
+              custom_id:
+                `cancel_${orderCode}`,
+            },
+          ],
+        },
+      ],
+    },
+  };
 }
 
-return res.status(400).json({
-  error: "Unknown interaction",
-});
+async function handlePaid(orderCode) {
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .eq("order_code", orderCode)
+    .single();
 
-} catch (error) {
-console.error("ERROR:", error);
+  if (error || !data) {
+    return responseMessage(
+      "❌ Order tidak ditemukan.",
+      true
+    );
+  }
 
-return res.status(500).json({
-  error: "Internal Server Error",
-});
-
+  return responseMessage(
+    `⏳ Pembayaran untuk \`${orderCode}\` sudah ditandai. Menunggu pengecekan admin.`,
+    true
+  );
 }
+
+async function handleCancel(
+  interaction,
+  orderCode
+) {
+  if (!isAdministrator(interaction)) {
+    return responseMessage(
+      "❌ Hanya Administrator yang dapat membatalkan order.",
+      true
+    );
+  }
+
+  const { error } = await supabase
+    .from("orders")
+    .update({
+      status: "CANCELLED",
+    })
+    .eq("order_code", orderCode)
+    .eq("status", "PENDING");
+
+  if (error) {
+    throw error;
+  }
+
+  return responseMessage(
+    `❌ Order \`${orderCode}\` dibatalkan.`,
+    true
+  );
+}
+
+module.exports = async (req, res) => {
+  try {
+    if (req.method !== "POST") {
+      return res
+        .status(405)
+        .json({
+          error: "Method Not Allowed",
+        });
+    }
+
+    const rawBody =
+      await readRawBody(req);
+
+    const signature =
+      req.headers[
+        "x-signature-ed25519"
+      ];
+
+    const timestamp =
+      req.headers[
+        "x-signature-timestamp"
+      ];
+
+    const verified =
+      verifyDiscordSignature(
+        rawBody,
+        signature,
+        timestamp
+      );
+
+    if (!verified) {
+      return res
+        .status(401)
+        .json({
+          error:
+            "Invalid request signature",
+        });
+    }
+
+    const interaction = JSON.parse(
+      rawBody.toString("utf8")
+    );
+
+    // Discord PING
+    if (interaction.type === 1) {
+      return res
+        .status(200)
+        .json({
+          type: 1,
+        });
+    }
+
+    // Slash Command
+    if (interaction.type === 2) {
+      if (
+        interaction.data?.name === "pay"
+      ) {
+        const result =
+          await handlePay(interaction);
+
+        return res
+          .status(200)
+          .json(result);
+      }
+
+      return res
+        .status(200)
+        .json(
+          responseMessage(
+            "❌ Command belum tersedia.",
+            true
+          )
+        );
+    }
+
+    // Button interaction
+    if (interaction.type === 3) {
+      const customId =
+        interaction.data?.custom_id ||
+        "";
+
+      if (
+        customId.startsWith("paid_")
+      ) {
+        const result =
+          await handlePaid(
+            customId.slice(5)
+          );
+
+        return res
+          .status(200)
+          .json(result);
+      }
+
+      if (
+        customId.startsWith("cancel_")
+      ) {
+        const result =
+          await handleCancel(
+            interaction,
+            customId.slice(7)
+          );
+
+        return res
+          .status(200)
+          .json(result);
+      }
+    }
+
+    return res
+      .status(400)
+      .json({
+        error:
+          "Unknown interaction",
+      });
+
+  } catch (error) {
+    console.error(error);
+
+    return res
+      .status(500)
+      .json({
+        error:
+          "Internal Server Error",
+
+        message:
+          error.message,
+      });
+  }
 };
