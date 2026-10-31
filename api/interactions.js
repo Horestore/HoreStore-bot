@@ -10,6 +10,10 @@ const QRIS_URL =
   process.env.QRIS_URL ||
   "https://horestorebot.vercel.app/qris.png.jpg";
 
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+  console.warn("⚠️ Peringatan: Supabase URL atau Service Key belum lengkap.");
+}
+
 const supabase = createClient(
   SUPABASE_URL,
   SUPABASE_SERVICE_KEY
@@ -129,56 +133,61 @@ async function discordFetch(endpoint) {
 // Membaca pesan terbaru dari Ticket King
 // dan mencari field "berapa robux?"
 async function readTicketOrder(channelId) {
-  const messages = await discordFetch(
-    `/channels/${channelId}/messages?limit=100`
-  );
+  try {
+    const messages = await discordFetch(
+      `/channels/${channelId}/messages?limit=100`
+    );
 
-  for (const message of messages) {
-    for (const embed of message.embeds || []) {
-      let robux = null;
-      let username = null;
+    for (const message of messages) {
+      for (const embed of message.embeds || []) {
+        let robux = null;
+        let username = null;
 
-      for (const field of embed.fields || []) {
-        const fieldName = String(
-          field.name || ""
-        )
-          .toLowerCase()
-          .trim();
+        for (const field of embed.fields || []) {
+          const fieldName = String(
+            field.name || ""
+          )
+            .toLowerCase()
+            .trim();
 
-        const fieldValue = String(
-          field.value || ""
-        ).trim();
+          const fieldValue = String(
+            field.value || ""
+          ).trim();
 
-        if (
-          fieldName.includes("berapa robux")
-        ) {
-          const digits = fieldValue.replace(
-            /[^\d]/g,
-            ""
-          );
+          if (
+            fieldName.includes("berapa robux") ||
+            fieldName.includes("robux")
+          ) {
+            const digits = fieldValue.replace(
+              /[^\d]/g,
+              ""
+            );
 
-          if (digits) {
-            robux = Number(digits);
+            if (digits) {
+              robux = Number(digits);
+            }
+          }
+
+          if (
+            fieldName === "username" ||
+            fieldName.includes("roblox username") ||
+            fieldName.includes("username roblox")
+          ) {
+            username = fieldValue;
           }
         }
 
-        if (
-          fieldName === "username" ||
-          fieldName.includes("roblox username") ||
-          fieldName.includes("username roblox")
-        ) {
-          username = fieldValue;
+        if (robux && robux > 0) {
+          return {
+            robux,
+            username,
+            messageId: message.id,
+          };
         }
       }
-
-      if (robux && robux > 0) {
-        return {
-          robux,
-          username,
-          messageId: message.id,
-        };
-      }
     }
+  } catch (err) {
+    console.error("Error reading ticket order:", err);
   }
 
   return null;
@@ -273,15 +282,9 @@ async function handlePay(interaction) {
   }
 
   const basePrice = calculatePrice(robux);
-
-  const uniqueCode =
-    await generateUniqueCode();
-
-  const totalPrice =
-    basePrice + uniqueCode;
-
-  const orderCode =
-    createOrderCode();
+  const uniqueCode = await generateUniqueCode();
+  const totalPrice = basePrice + uniqueCode;
+  const orderCode = createOrderCode();
 
   const { error } = await supabase
     .from("orders")
@@ -289,8 +292,7 @@ async function handlePay(interaction) {
       order_code: orderCode,
       discord_id: "TICKET_BUYER",
       discord_username: "Ticket King Buyer",
-      roblox_username:
-        ticket.username || null,
+      roblox_username: ticket.username || null,
       robux: robux,
       base_price: basePrice,
       unique_code: uniqueCode,
@@ -305,13 +307,10 @@ async function handlePay(interaction) {
 
   return {
     type: 4,
-
     data: {
       embeds: [
         {
-          title:
-            "💳 PEMBAYARAN HORE STORE",
-
+          title: "💳 PEMBAYARAN HORE STORE",
           description:
             `🧾 **Order:** \`${orderCode}\`\n\n` +
             `🎮 **Username:** \`${ticket.username || "-"}\`\n` +
@@ -321,41 +320,29 @@ async function handlePay(interaction) {
             `💳 **TOTAL BAYAR: ${rupiah(totalPrice)}**\n\n` +
             `⚠️ Bayar tepat sesuai nominal.\n` +
             `📱 Scan QRIS di bawah.`,
-
           image: {
             url: QRIS_URL,
           },
-
           footer: {
-            text:
-              "HORE STORE • Menunggu Pembayaran",
+            text: "HORE STORE • Menunggu Pembayaran",
           },
         },
       ],
-
       components: [
         {
           type: 1,
-
           components: [
             {
               type: 2,
               style: 3,
-              label:
-                "💳 Saya Sudah Bayar",
-
-              custom_id:
-                `paid_${orderCode}`,
+              label: "💳 Saya Sudah Bayar",
+              custom_id: `paid_${orderCode}`,
             },
-
             {
               type: 2,
               style: 4,
-              label:
-                "❌ Batalkan",
-
-              custom_id:
-                `cancel_${orderCode}`,
+              label: "❌ Batalkan",
+              custom_id: `cancel_${orderCode}`,
             },
           ],
         },
@@ -365,21 +352,23 @@ async function handlePay(interaction) {
 }
 
 async function handlePaid(orderCode) {
+  // Update status order menjadi WAITING_CONFIRMATION agar tercatat di database
   const { data, error } = await supabase
     .from("orders")
-    .select("*")
+    .update({ status: "WAITING_CONFIRMATION" })
     .eq("order_code", orderCode)
+    .select()
     .single();
 
   if (error || !data) {
     return responseMessage(
-      "❌ Order tidak ditemukan.",
+      "❌ Order tidak ditemukan atau sudah diproses.",
       true
     );
   }
 
   return responseMessage(
-    `⏳ Pembayaran untuk \`${orderCode}\` sudah ditandai. Menunggu pengecekan admin.`,
+    `✅ Konfirmasi diterima untuk \`${orderCode}\`! Mohon tunggu sebentar, admin akan segera mengecek mutasi pembayaran Anda.`,
     true
   );
 }
@@ -423,18 +412,13 @@ module.exports = async (req, res) => {
         });
     }
 
-    const rawBody =
-      await readRawBody(req);
+    const rawBody = await readRawBody(req);
 
     const signature =
-      req.headers[
-        "x-signature-ed25519"
-      ];
+      req.headers["x-signature-ed25519"];
 
     const timestamp =
-      req.headers[
-        "x-signature-timestamp"
-      ];
+      req.headers["x-signature-timestamp"];
 
     const verified =
       verifyDiscordSignature(
@@ -447,8 +431,7 @@ module.exports = async (req, res) => {
       return res
         .status(401)
         .json({
-          error:
-            "Invalid request signature",
+          error: "Invalid request signature",
         });
     }
 
@@ -491,8 +474,7 @@ module.exports = async (req, res) => {
     // Button interaction
     if (interaction.type === 3) {
       const customId =
-        interaction.data?.custom_id ||
-        "";
+        interaction.data?.custom_id || "";
 
       if (
         customId.startsWith("paid_")
@@ -517,6 +499,29 @@ module.exports = async (req, res) => {
           );
 
         return res
+          .status(200)
+          .json(result);
+      }
+    }
+
+    return res
+      .status(400)
+      .json({
+        error: "Unknown interaction",
+      });
+
+  } catch (error) {
+    console.error("API Error:", error);
+
+    return res
+      .status(500)
+      .json({
+        error: "Internal Server Error",
+        message: error.message,
+      });
+  }
+};
+      return res
           .status(200)
           .json(result);
       }
